@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Monitor em tempo real — Monad Mainnet</title>
+  <style>
+    :root{--bg:#071029;--card:#0b1220;--accent:#06b6d4;--muted:#94a3b8}
+    *{box-sizing:border-box;font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+    body{margin:0;min-height:100vh;background:linear-gradient(180deg,#061022 0%,#041226 100%);color:#e6eef8;padding:18px}
+    .wrap{max-width:1100px;margin:0 auto}
+    header{display:flex;align-items:center;gap:12px}
+    h1{margin:0;font-size:18px}
+    .controls{display:flex;gap:8px;margin-top:12px;align-items:center}
+    input,select,button{padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:rgba(255,255,255,0.02);color:inherit}
+    button{cursor:pointer}
+    .grid{display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-top:16px}
+    .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.03);min-height:160px}
+    .list{max-height:60vh;overflow:auto;padding:6px}
+    .item{padding:8px;border-radius:8px;border-bottom:1px dashed rgba(255,255,255,0.03)}
+    .txhash{font-family:monospace;font-size:12px;color:var(--muted)}
+    .small{font-size:13px;color:var(--muted)}
+    .badge{display:inline-block;padding:6px 8px;border-radius:999px;background:rgba(255,255,255,0.02);font-size:12px}
+    .dn{display:none}
+    footer{margin-top:12px;color:var(--muted);font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Monad Mainnet</h1>
+      <div style="margin-left:auto" class="small">RPC padrão: <span id="rpcDisplay">https://rpc.monad.xyz</span> · Chain ID: <span id="chainDisplay">143</span></div>
+    </header>
+
+    
+
+    <div class="grid">
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div><strong>Últimos blocos</strong> <span class="small">(clicar para ver detalhes)</span></div>
+          <div class="small">Bloco atual: <span id="currentBlock">—</span></div>
+        </div>
+        <div id="blocks" class="list"></div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+          <div><strong>Transações recentes</strong></div>
+          <div class="small dn">Filtrar: <select id="txFilter"><option value="all">Todas</option><option value="in">Recebidas</option><option value="out">Enviadas</option></select></div>
+        </div>
+        <div id="txs" class="list"></div>
+      </div>
+    </div>
+    <div class="controls">
+          <input id="search" placeholder="Buscar por bloco ou endereço" style="width:300px" />
+          <button id="searchBtn">Buscar</button>
+          <label class="small dn">RPC (HTTP): <input id="rpc" value="https://rpc.monad.xyz" style="width:420px"></label>
+          <label class="small dn">Polling (ms): <input id="interval" value="2000" style="width:100px"></label>
+          <button id="start" class="dn">Iniciar</button>
+          <button id="stop" class="dn">Parar</button>
+          <button id="tryWs" class="dn">Tentar WebSocket</button>
+        </div>
+  </div>
+
+  <script>
+    // Defaults
+    let RPC = document.getElementById('rpc').value.trim();
+    const CHAIN = 143;
+    const blocksEl = document.getElementById('blocks');
+    const txsEl = document.getElementById('txs');
+    const currentBlockEl = document.getElementById('currentBlock');
+    const rpcDisplay = document.getElementById('rpcDisplay');
+    const chainDisplay = document.getElementById('chainDisplay');
+
+    rpcDisplay.textContent = RPC;
+    chainDisplay.textContent = CHAIN;
+
+    let polling = false;
+    let pollInterval = 2000;
+    let pollTimer = null;
+    let seenBlocks = new Set();
+    let seenTxs = new Set();
+
+    function rpcRequest(method, params = []){
+      return fetch(RPC, {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({jsonrpc:'2.0',id:1,method,params})
+      }).then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }).then(d=>{ if(d.error) throw new Error(d.error.message || JSON.stringify(d.error)); return d.result; });
+    }
+
+    async function fetchLatest(){
+      try{
+        const blockHex = await rpcRequest('eth_blockNumber');
+        const blockNum = Number(BigInt(blockHex));
+        currentBlockEl.textContent = blockNum;
+        // get the block with transactions
+        const block = await rpcRequest('eth_getBlockByNumber', [blockHex, true]);
+        if(block && block.number){
+          const bn = Number(BigInt(block.number));
+          if(!seenBlocks.has(block.hash)){
+            seenBlocks.add(block.hash);
+            addBlockItem(block);
+            // add txs
+            if(block.transactions && block.transactions.length){
+              for(const tx of block.transactions.slice().reverse()){
+                if(!seenTxs.has(tx.hash)){
+                  seenTxs.add(tx.hash);
+                  addTxItem(tx, bn);
+                }
+              }
+            }
+            // keep sets small
+            if(seenBlocks.size > 200) seenBlocks = new Set(Array.from(seenBlocks).slice(-150));
+            if(seenTxs.size > 1000) seenTxs = new Set(Array.from(seenTxs).slice(-800));
+          }
+        }
+      }catch(err){
+        console.error('fetchLatest error', err);
+      }
+    }
+
+    function addBlockItem(block){
+      const el = document.createElement('div');
+      el.className = 'item';
+      const num = Number(BigInt(block.number));
+      el.innerHTML = `<div style=\"display:flex;justify-content:space-between;align-items:center\"><div><strong>#${num}</strong> <span class=\"small\">txs: ${block.transactions ? block.transactions.length : 0}</span></div><div class=\"small\">${new Date().toLocaleTimeString()}</div></div><div style=\"margin-top:6px\"><span class=\"txhash\">${block.hash}</span></div>`;
+      el.addEventListener('click', ()=>{
+        const modal = document.createElement('div');
+        modal.style.position='fixed';modal.style.inset=0;modal.style.background='rgba(0,0,0,0.6)';modal.style.display='flex';modal.style.alignItems='center';modal.style.justifyContent='center';
+        const box = document.createElement('div');box.style.maxWidth='90%';box.style.maxHeight='80%';box.style.overflow='auto';box.style.background='#071226';box.style.padding='12px';box.style.borderRadius='10px';box.style.border='1px solid rgba(255,255,255,0.03)';
+        box.innerHTML = `
+  <h3>Bloco #${num}</h3>
+  <div style="margin-top:10px;font-size:14px;line-height:1.4">
+    <div><strong>Hash:</strong> <span class="txhash">${block.hash}</span></div>
+    <div><strong>Timestamp:</strong> ${block.timestamp ? new Date(Number(BigInt(block.timestamp)) * 1000).toLocaleString() : '-'}</div>
+    <div><strong>Proposer / Miner:</strong> <span class="txhash">${block.miner || '-'}</span></div>
+    <div><strong>Gas usado:</strong> ${block.gasUsed ? Number(BigInt(block.gasUsed)).toLocaleString() : '-'}</div>
+    <div><strong>Gas limite:</strong> ${block.gasLimit ? Number(BigInt(block.gasLimit)).toLocaleString() : '-'}</div>
+    <div><strong>Total de transações:</strong> ${block.transactions ? block.transactions.length : 0}</div>
+  </div>
+
+  <div style="margin-top:15px">
+    <strong>Transações:</strong>
+    <div style="max-height:300px;overflow:auto;margin-top:6px;padding-right:6px">
+      ${block.transactions && block.transactions.length
+        ? block.transactions.map(tx => `
+          <div style='padding:6px 0;border-bottom:1px dashed rgba(255,255,255,0.06)'>
+            <div class='txhash'>${tx.hash}</div>
+            <div class='small'>De: <span class='txhash'>${tx.from}</span></div>
+            <div class='small'>Para: <span class='txhash'>${tx.to || '(contrato)'}</span></div>
+            <div class='small'>Valor: ${tx.value ? (Number(BigInt(tx.value)) / 1e18).toFixed(6) + ' MON' : '0'}</div>
+            <div class='small'>Gas: ${tx.gas ? Number(BigInt(tx.gas)).toLocaleString() : '-'}</div>
+          </div>`).join('')
+        : `<div class='small muted'>Nenhuma transação neste bloco</div>`
+      }
+    </div>
+  </div>
+
+  <div style="margin-top:18px"><button id="close">Fechar</button></div>
+`;
+        modal.appendChild(box);document.body.appendChild(modal);
+        box.querySelector('#close').addEventListener('click', ()=>document.body.removeChild(modal));
+      });
+      blocksEl.prepend(el);
+      // limit
+      while(blocksEl.children.length > 60) blocksEl.removeChild(blocksEl.lastChild);
+    }
+
+    function addTxItem(tx, blockNumber){
+      const el = document.createElement('div');
+      el.className = 'item';
+      const from = tx.from || '-';
+      const to = tx.to || '(contract)';
+
+      el.innerHTML = `
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div><strong class="txhash">${tx.hash}</strong></div>
+          <div class="small">blk: ${blockNumber}</div>
+        </div>
+        <div style="margin-top:6px">
+          from: <span class="txhash">${from}</span> → to: <span class="txhash">${to}</span>
+        </div>
+      `;
+
+      el.addEventListener('click', ()=>{
+        const modal = document.createElement('div');
+        modal.style.position='fixed';
+        modal.style.inset=0;
+        modal.style.background='rgba(0,0,0,0.6)';
+        modal.style.display='flex';
+        modal.style.alignItems='center';
+        modal.style.justifyContent='center';
+
+        const box = document.createElement('div');
+        box.style.maxWidth='90%';
+        box.style.maxHeight='80%';
+        box.style.overflow='auto';
+        box.style.background='#071226';
+        box.style.padding='12px';
+        box.style.borderRadius='10px';
+        box.style.border='1px solid rgba(255,255,255,0.03)';
+
+        box.innerHTML = `
+          <h3>Transação</h3>
+          <div style="margin-top:10px;font-size:14px;line-height:1.4">
+            <div><strong>Hash:</strong> <span class="txhash">${tx.hash}</span></div>
+            <div><strong>De:</strong> <span class="txhash">${tx.from}</span></div>
+            <div><strong>Para:</strong> <span class="txhash">${tx.to || '(contrato)'}</span></div>
+            <div><strong>Valor:</strong> ${tx.value ? (Number(BigInt(tx.value)) / 1e18).toFixed(6) + ' MON' : '0'}</div>
+            <div><strong>Gas:</strong> ${tx.gas ? Number(BigInt(tx.gas)).toLocaleString() : '-'}</div>
+            <div><strong>Gas Price:</strong> ${tx.gasPrice ? Number(BigInt(tx.gasPrice)).toLocaleString() : '-'}</div>
+          </div>
+
+          <div style="margin-top:15px">
+            <strong>JSON Completo:</strong>
+            <pre style="white-space:pre-wrap;margin-top:6px">${JSON.stringify(tx,null,2)}</pre>
+          </div>
+
+          <div style="text-align:right;margin-top:8px">
+            <button id="close">Fechar</button>
+          </div>
+        `;
+
+        modal.appendChild(box);
+        document.body.appendChild(modal);
+        box.querySelector('#close').addEventListener('click', ()=>document.body.removeChild(modal));
+      });
+
+      const filter = document.getElementById('txFilter').value;
+      const myAccount = null;
+      if(filter === 'in' && myAccount && tx.to && tx.to.toLowerCase() !== myAccount.toLowerCase()) return;
+      if(filter === 'out' && myAccount && tx.from && tx.from.toLowerCase() !== myAccount.toLowerCase()) return;
+
+      txsEl.prepend(el);
+      while(txsEl.children.length > 200) txsEl.removeChild(txsEl.lastChild);
+    }
+    while(txsEl.children.length > 200) txsEl.removeChild(txsEl.lastChild);
+    function startPolling(){
+      if(polling) return;
+      polling = true;
+      pollInterval = Number(document.getElementById('interval').value) || 2000;
+      RPC = document.getElementById('rpc').value.trim() || RPC;
+      rpcDisplay.textContent = RPC;
+      fetchLatest();
+      pollTimer = setInterval(fetchLatest, pollInterval);
+    }
+
+    function stopPolling(){
+      polling = false;
+      if(pollTimer) clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    document.getElementById('start').addEventListener('click', startPolling);
+    document.getElementById('stop').addEventListener('click', stopPolling);
+
+    // WebSocket attempt: prompt for ws url
+    document.getElementById('tryWs').addEventListener('click', ()=>{
+      const wsUrl = prompt('Insira o endpoint WebSocket (wss://...) para o nó RPC (ex: wss://...):');
+      if(!wsUrl) return;
+      tryWs(wsUrl);
+    });
+
+    function tryWs(url){
+      try{
+        const ws = new WebSocket(url);
+        ws.onopen = ()=>{
+          console.log('WS aberto');
+          // try subscribe newHeads
+          ws.send(JSON.stringify({jsonrpc:'2.0',id:1,method:'eth_subscribe',params:['newHeads']}));
+        };
+        ws.onmessage = (ev)=>{
+          try{
+            const d = JSON.parse(ev.data);
+            if(d.method === 'eth_subscription' && d.params){
+              const payload = d.params.result;
+              if(payload && payload.number){
+                // get full block by number
+                const numHex = payload.number;
+                rpcRequest('eth_getBlockByNumber',[numHex, true]).then(block => {
+                  if(block && !seenBlocks.has(block.hash)){
+                    seenBlocks.add(block.hash);
+                    addBlockItem(block);
+                    if(block.transactions) for(const tx of block.transactions) if(!seenTxs.has(tx.hash)){ seenTxs.add(tx.hash); addTxItem(tx, Number(BigInt(block.number))); }
+                  }
+                }).catch(e=>console.error('getBlockByNumber failed',e));
+              }
+            }
+          }catch(e){console.error(e)}
+        };
+        ws.onerror = (e)=>{alert('WebSocket error. Veja console.');console.error(e);};
+        ws.onclose = ()=>{console.log('WS fechado')};
+        alert('Tentativa de conexão ao WebSocket iniciada — veja console para status.');
+      }catch(err){alert('Erro ao abrir WebSocket: '+err.message)}
+    }
+
+    // start automatically
+    startPolling();
+  
+
+// ==== BARRA DE PESQUISA ====
+// Cria área de resultado se não existir
+let searchResultBox = document.getElementById('searchResults');
+if(!searchResultBox){
+  searchResultBox = document.createElement('div');
+  searchResultBox.id = 'searchResults';
+  searchResultBox.style.marginTop = '12px';
+  searchResultBox.style.padding = '10px';
+  searchResultBox.style.background = 'rgba(255,255,255,0.03)';
+  searchResultBox.style.border = '1px solid rgba(255,255,255,0.05)';
+  searchResultBox.style.borderRadius = '8px';
+  document.querySelector('.wrap').appendChild(searchResultBox);
+}
+
+const searchInput = document.getElementById('search');
+const searchBtn = document.getElementById('searchBtn');
+
+function showSearchResult(html){
+  searchResultBox.innerHTML = html;
+  searchResultBox.scrollIntoView({behavior:'smooth'});
+}
+
+async function runSearch(){
+  const q = (searchInput?.value || '').trim();
+  if(!q){ showSearchResult('<div class="small">Digite algo para buscar.</div>'); return; }
+
+  // BUSCA POR BLOCO (NÚMERO)
+  if(/^[0-9]+$/.test(q)){
+    const hex = '0x' + BigInt(q).toString(16);
+    const block = await rpcRequest('eth_getBlockByNumber', [hex, true]).catch(()=>null);
+
+    if(block){
+      const num = Number(BigInt(block.number));
+      showSearchResult(`
+        <h3>Bloco #${num}</h3>
+        <div><strong>Hash:</strong> <span class="txhash">${block.hash}</span></div>
+        <div><strong>Txs:</strong> ${block.transactions?.length || 0}</div>
+        <pre style="white-space:pre-wrap;margin-top:8px">${JSON.stringify(block,null,2)}</pre>
+      `);
+      return;
+    }
+  }
+
+  // BUSCA POR HASH DE TRANSAÇÃO
+  if(/^0x[a-fA-F0-9]{64}$/.test(q)){
+    const tx = await rpcRequest('eth_getTransactionByHash',[q]).catch(()=>null);
+    if(tx){
+      showSearchResult(`
+        <h3>Transação</h3>
+        <div><strong>Hash:</strong> <span class="txhash">${tx.hash}</span></div>
+        <div><strong>De:</strong> <span class="txhash">${tx.from}</span></div>
+        <div><strong>Para:</strong> <span class="txhash">${tx.to || '(contrato)'}</span></div>
+        <div><strong>Valor:</strong> ${tx.value ? (Number(BigInt(tx.value)) / 1e18).toFixed(6) + ' MON' : '0'}</div>
+        <pre style="white-space:pre-wrap;margin-top:8px">${JSON.stringify(tx,null,2)}</pre>
+      `);
+      return;
+    }
+  }
+
+  // BUSCA POR ENDEREÇO
+  if(/^0x[a-fA-F0-9]{40}$/.test(q)){
+    const balHex = await rpcRequest('eth_getBalance',[q,'latest']).catch(()=>null);
+    const balance = balHex ? (Number(BigInt(balHex)) / 1e18).toFixed(6) + ' MON' : 'erro';
+
+    showSearchResult(`
+      <h3>Endereço ${q}</h3>
+      <div><strong>Saldo:</strong> ${balance}</div>
+    `);
+    return;
+  }
+
+  showSearchResult('<div class="small">Nenhum resultado encontrado.</div>');
+}
+
+searchBtn?.addEventListener('click', runSearch);
+searchInput?.addEventListener('keydown', e=>{ if(e.key==='Enter') runSearch(); });
+
+</script>
+</body>
+</html>
